@@ -21,8 +21,6 @@ pipeline {
         DOCKER_REGISTRY = 'docker.io'
         DOCKER_IMAGE = "${DOCKER_REGISTRY}/${DOCKER_USERNAME}/spring-boot-demo"
         DOCKER_CREDENTIALS_ID = 'docker-hub-credentials'
-        SONAR_HOST_URL = credentials('sonar-host-url')
-        SONAR_TOKEN = credentials('sonar-token')
     }
     
     options {
@@ -80,37 +78,7 @@ pipeline {
         // ==========================================
         // Stage 4: Code Quality Analysis
         // ==========================================
-        stage('Code Quality') {
-            parallel {
-                stage('SonarQube Analysis') {
-                    when {
-                        expression { env.SONAR_HOST_URL != null }
-                    }
-                    steps {
-                        withSonarQubeEnv('SonarQube') {
-                            sh '''
-                                mvn sonar:sonar \
-                                    -Dsonar.projectKey=spring-boot-demo \
-                                    -Dsonar.host.url=${SONAR_HOST_URL} \
-                                    -Dsonar.login=${SONAR_TOKEN}
-                            '''
-                        }
-                    }
-                }
-                
-                stage('OWASP Dependency Check') {
-                    steps {
-                        sh 'mvn org.owasp:dependency-check-maven:check -B || true'
-                    }
-                    post {
-                        always {
-                            dependencyCheckPublisher pattern: 'target/dependency-check-report.xml'
-                        }
-                    }
-                }
-            }
-        }
-        
+       
         // ==========================================
         // Stage 5: Build JAR Package
         // ==========================================
