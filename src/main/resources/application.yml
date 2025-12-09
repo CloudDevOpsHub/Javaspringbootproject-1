@@ -1,0 +1,33 @@
+spring:
+  application:
+    name: spring-boot-demo
+
+server:
+  port: 8080
+  servlet:
+    context-path: /
+
+# Application Info
+app:
+  version: 1.0.0
+
+# Actuator Configuration
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  info:
+    env:
+      enabled: true
+
+# Logging
+logging:
+  level:
+    root: INFO
+    com.clouddevopshub: DEBUG
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"

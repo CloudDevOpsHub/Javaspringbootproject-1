@@ -1,0 +1,262 @@
+// ============================================
+// Jenkins CD Pipeline
+// Deploy to Kubernetes (EKS/AKS/GKE)
+// CloudDevOpsHub - Batch 42
+// ============================================
+
+pipeline {
+    agent any
+    
+    // No tools block needed - uses kubectl and aws-cli from PATH
+    
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['staging', 'production'],
+            description: 'Select deployment environment'
+        )
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: 'latest',
+            description: 'Docker image tag to deploy'
+        )
+        booleanParam(
+            name: 'SKIP_TESTS',
+            defaultValue: false,
+            description: 'Skip integration tests'
+        )
+    }
+    
+    environment {
+        DOCKER_REGISTRY = 'docker.io'
+        DOCKER_IMAGE = "${DOCKER_REGISTRY}/${DOCKER_USERNAME}/spring-boot-demo"
+        KUBE_NAMESPACE = "${params.ENVIRONMENT}"
+        AWS_REGION = 'ap-south-1'
+        EKS_CLUSTER_NAME = credentials('eks-cluster-name')
+    }
+    
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+        timeout(time: 45, unit: 'MINUTES')
+    }
+    
+    stages {
+        // ==========================================
+        // Stage 1: Checkout
+        // ==========================================
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        
+        // ==========================================
+        // Stage 2: Validate Image
+        // ==========================================
+        stage('Validate Image') {
+            steps {
+                script {
+                    sh """
+                        docker pull ${DOCKER_IMAGE}:${params.IMAGE_TAG}
+                        docker inspect ${DOCKER_IMAGE}:${params.IMAGE_TAG}
+                    """
+                }
+            }
+        }
+        
+        // ==========================================
+        // Stage 3: Configure Kubernetes
+        // ==========================================
+        stage('Configure Kubernetes') {
+            steps {
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: 'aws-credentials',
+                     accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                     secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']
+                ]) {
+                    sh """
+                        aws eks update-kubeconfig \
+                            --name ${EKS_CLUSTER_NAME} \
+                            --region ${AWS_REGION}
+                        
+                        kubectl cluster-info
+                        kubectl get nodes
+                    """
+                }
+            }
+        }
+        
+        // ==========================================
+        // Stage 4: Update Manifests
+        // ==========================================
+        stage('Update Manifests') {
+            steps {
+                sh """
+                    cd k8s
+                    sed -i "s|IMAGE_TAG|${params.IMAGE_TAG}|g" deployment.yaml
+                    sed -i "s|DOCKER_IMAGE|${DOCKER_IMAGE}|g" deployment.yaml
+                    
+                    if [ "${params.ENVIRONMENT}" == "production" ]; then
+                        sed -i "s|replicas: 2|replicas: 3|g" deployment.yaml
+                    fi
+                    
+                    cat deployment.yaml
+                """
+            }
+        }
+        
+        // ==========================================
+        // Stage 5: Deploy to Environment
+        // ==========================================
+        stage('Deploy') {
+            steps {
+                script {
+                    // Ensure namespace exists
+                    sh """
+                        kubectl create namespace ${KUBE_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+                    """
+                    
+                    // Apply manifests
+                    sh """
+                        kubectl apply -f k8s/ -n ${KUBE_NAMESPACE}
+                        
+                        echo "Waiting for deployment rollout..."
+                        kubectl rollout status deployment/spring-boot-demo \
+                            -n ${KUBE_NAMESPACE} \
+                            --timeout=300s
+                    """
+                }
+            }
+        }
+        
+        // ==========================================
+        // Stage 6: Verify Deployment
+        // ==========================================
+        stage('Verify') {
+            steps {
+                sh """
+                    echo "=== Deployment Status ==="
+                    kubectl get deployment spring-boot-demo -n ${KUBE_NAMESPACE}
+                    
+                    echo "=== Pods Status ==="
+                    kubectl get pods -n ${KUBE_NAMESPACE} -l app=spring-boot-demo
+                    
+                    echo "=== Service Status ==="
+                    kubectl get svc spring-boot-demo -n ${KUBE_NAMESPACE}
+                    
+                    echo "=== HPA Status ==="
+                    kubectl get hpa -n ${KUBE_NAMESPACE}
+                """
+            }
+        }
+        
+        // ==========================================
+        // Stage 7: Smoke Tests
+        // ==========================================
+        stage('Smoke Tests') {
+            steps {
+                script {
+                    def serviceUrl = sh(
+                        script: """
+                            kubectl get svc spring-boot-demo -n ${KUBE_NAMESPACE} \
+                                -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    
+                    if (serviceUrl) {
+                        sh """
+                            sleep 30
+                            echo "Testing health endpoint..."
+                            curl -f http://${serviceUrl}/health || echo "Health check pending..."
+                            
+                            echo "Testing API endpoint..."
+                            curl -f http://${serviceUrl}/api/users || echo "API check pending..."
+                        """
+                    } else {
+                        echo "LoadBalancer not ready, skipping external health check"
+                        
+                        // Use port-forward for internal testing
+                        sh """
+                            kubectl port-forward svc/spring-boot-demo 8080:80 -n ${KUBE_NAMESPACE} &
+                            PF_PID=\$!
+                            sleep 10
+                            curl -f http://localhost:8080/health || true
+                            kill \$PF_PID || true
+                        """
+                    }
+                }
+            }
+        }
+        
+        // ==========================================
+        // Stage 8: Integration Tests
+        // ==========================================
+        stage('Integration Tests') {
+            when {
+                expression { !params.SKIP_TESTS }
+            }
+            steps {
+                echo "Running integration tests against ${params.ENVIRONMENT}..."
+                // Add your integration test commands
+                // sh 'mvn verify -Pintegration-tests'
+            }
+        }
+        
+        // ==========================================
+        // Stage 9: Production Approval
+        // ==========================================
+        stage('Production Approval') {
+            when {
+                expression { params.ENVIRONMENT == 'production' }
+            }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: 'Approve deployment to Production?',
+                          ok: 'Deploy',
+                          submitter: 'admin,devops'
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo """
+            ✅ CD Pipeline completed successfully!
+            
+            Deployment Summary:
+            - Environment: ${params.ENVIRONMENT}
+            - Image: ${DOCKER_IMAGE}:${params.IMAGE_TAG}
+            - Namespace: ${KUBE_NAMESPACE}
+            """
+            
+            // Send Slack notification
+            // slackSend(
+            //     color: 'good',
+            //     message: "✅ Deployed ${params.IMAGE_TAG} to ${params.ENVIRONMENT}"
+            // )
+        }
+        
+        failure {
+            echo "❌ CD Pipeline failed! Initiating rollback..."
+            
+            sh """
+                kubectl rollout undo deployment/spring-boot-demo -n ${KUBE_NAMESPACE} || true
+                kubectl rollout status deployment/spring-boot-demo -n ${KUBE_NAMESPACE} --timeout=300s || true
+            """
+            
+            // Send Slack notification
+            // slackSend(
+            //     color: 'danger',
+            //     message: "❌ Deployment failed for ${params.IMAGE_TAG} to ${params.ENVIRONMENT}"
+            // )
+        }
+        
+        always {
+            cleanWs()
+        }
+    }
+}

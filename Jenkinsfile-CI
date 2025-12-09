@@ -1,0 +1,209 @@
+// ============================================
+// Jenkins CI Pipeline
+// Build, Test, Scan, and Push Docker Image
+// CloudDevOpsHub - Batch 42
+// ============================================
+
+pipeline {
+    agent any
+    
+    // Option 1: Use exact tool names from Jenkins Global Tool Configuration
+    // tools {
+    //     maven 'maven-3.9'    // Use exact name from Jenkins
+    //     jdk 'jdk-17'         // Use exact name from Jenkins
+    // }
+    
+    environment {
+        // Option 2: Use environment variables (More Flexible)
+        JAVA_HOME = '/usr/lib/jvm/java-17-openjdk-amd64'
+        MAVEN_HOME = '/usr/share/maven'
+        PATH = "${MAVEN_HOME}/bin:${JAVA_HOME}/bin:${env.PATH}"
+        DOCKER_REGISTRY = 'docker.io'
+        DOCKER_IMAGE = "${DOCKER_REGISTRY}/${DOCKER_USERNAME}/spring-boot-demo"
+        DOCKER_CREDENTIALS_ID = 'docker-hub-credentials'
+        SONAR_HOST_URL = credentials('sonar-host-url')
+        SONAR_TOKEN = credentials('sonar-token')
+    }
+    
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+    
+    stages {
+        // ==========================================
+        // Stage 1: Checkout
+        // ==========================================
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: "git rev-parse --short HEAD",
+                        returnStdout: true
+                    ).trim()
+                    env.BUILD_TAG = "${env.BRANCH_NAME}-${env.GIT_COMMIT_SHORT}-${env.BUILD_NUMBER}"
+                }
+            }
+        }
+        
+        // ==========================================
+        // Stage 2: Build
+        // ==========================================
+        stage('Build') {
+            steps {
+                sh 'mvn clean compile -B -DskipTests'
+            }
+        }
+        
+        // ==========================================
+        // Stage 3: Unit Tests
+        // ==========================================
+        stage('Unit Tests') {
+            steps {
+                sh 'mvn test -B'
+            }
+            post {
+                always {
+                    junit '**/target/surefire-reports/*.xml'
+                    jacoco(
+                        execPattern: '**/target/*.exec',
+                        classPattern: '**/target/classes',
+                        sourcePattern: '**/src/main/java'
+                    )
+                }
+            }
+        }
+        
+        // ==========================================
+        // Stage 4: Code Quality Analysis
+        // ==========================================
+        stage('Code Quality') {
+            parallel {
+                stage('SonarQube Analysis') {
+                    when {
+                        expression { env.SONAR_HOST_URL != null }
+                    }
+                    steps {
+                        withSonarQubeEnv('SonarQube') {
+                            sh '''
+                                mvn sonar:sonar \
+                                    -Dsonar.projectKey=spring-boot-demo \
+                                    -Dsonar.host.url=${SONAR_HOST_URL} \
+                                    -Dsonar.login=${SONAR_TOKEN}
+                            '''
+                        }
+                    }
+                }
+                
+                stage('OWASP Dependency Check') {
+                    steps {
+                        sh 'mvn org.owasp:dependency-check-maven:check -B || true'
+                    }
+                    post {
+                        always {
+                            dependencyCheckPublisher pattern: 'target/dependency-check-report.xml'
+                        }
+                    }
+                }
+            }
+        }
+        
+        // ==========================================
+        // Stage 5: Build JAR Package
+        // ==========================================
+        stage('Package') {
+            steps {
+                sh 'mvn package -B -DskipTests'
+                archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+            }
+        }
+        
+        // ==========================================
+        // Stage 6: Build Docker Image
+        // ==========================================
+        stage('Docker Build') {
+            steps {
+                script {
+                    docker.build("${DOCKER_IMAGE}:${BUILD_TAG}")
+                    docker.build("${DOCKER_IMAGE}:latest")
+                }
+            }
+        }
+        
+        // ==========================================
+        // Stage 7: Scan Docker Image
+        // ==========================================
+        stage('Security Scan') {
+            steps {
+                sh """
+                    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                        aquasec/trivy:latest image \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        ${DOCKER_IMAGE}:${BUILD_TAG}
+                """
+            }
+        }
+        
+        // ==========================================
+        // Stage 8: Push Docker Image
+        // ==========================================
+        stage('Docker Push') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            steps {
+                script {
+                    docker.withRegistry("https://${DOCKER_REGISTRY}", DOCKER_CREDENTIALS_ID) {
+                        docker.image("${DOCKER_IMAGE}:${BUILD_TAG}").push()
+                        if (env.BRANCH_NAME == 'main') {
+                            docker.image("${DOCKER_IMAGE}:latest").push()
+                        }
+                    }
+                }
+            }
+        }
+        
+        // ==========================================
+        // Stage 9: Update Manifest (GitOps)
+        // ==========================================
+        stage('Update Manifest') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    writeFile file: 'image-tag.txt', text: "${BUILD_TAG}"
+                    archiveArtifacts artifacts: 'image-tag.txt', fingerprint: true
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo "✅ CI Pipeline completed successfully!"
+            echo "Image: ${DOCKER_IMAGE}:${BUILD_TAG}"
+            
+            // Trigger CD Pipeline
+            build job: 'spring-boot-demo-cd',
+                  parameters: [
+                      string(name: 'IMAGE_TAG', value: "${BUILD_TAG}"),
+                      string(name: 'ENVIRONMENT', value: 'staging')
+                  ],
+                  wait: false
+        }
+        failure {
+            echo "❌ CI Pipeline failed!"
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
